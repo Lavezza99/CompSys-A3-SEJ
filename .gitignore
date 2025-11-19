@@ -1,0 +1,26 @@
+# Compiled objects
+*.o
+*.out
+*.exe
+
+# Built peer binary
+peer
+
+# Core dumps / debug stuff
+core
+*.core
+*.log
+
+# Submission archive
+src.zip
+
+# Editor / IDE junk
+*~
+*.swp
+*.swo
+.vscode/
+.idea/
+
+# OS cruft
+.DS_Store
+Thumbs.db
