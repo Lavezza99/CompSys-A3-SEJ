@@ -40,6 +40,8 @@
 #define SALT_LEN                16
 #define PASSWORD_LEN            16
 
+#define LEN_COMMAND_LENGTH      4
+
 // container for hasher
 typedef uint8_t hashdata_t[SHA256_HASH_SIZE];
 
