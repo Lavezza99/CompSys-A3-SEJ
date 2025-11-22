@@ -153,12 +153,16 @@ static void handle_register_request(int connfd, const char* sender_ip, uint32_t 
     char salt[SALT_LEN];
     generate_random_salt(salt);
     
-    // Calculate saveable signature (SHA256 of provided signature + salt)
+    // Calculate saveable signature (SHA256(sender_signature || salt))
     hashdata_t saveable_sig;
-    char combined[PASSWORD_LEN + SALT_LEN];
+    char combined[SHA256_HASH_SIZE + SALT_LEN];
+
     memcpy(combined, sender_signature, SHA256_HASH_SIZE);
     memcpy(combined + SHA256_HASH_SIZE, salt, SALT_LEN);
-    get_data_sha(combined, saveable_sig, SHA256_HASH_SIZE + SALT_LEN, SHA256_HASH_SIZE);
+
+    get_data_sha(combined, saveable_sig,
+                SHA256_HASH_SIZE + SALT_LEN, SHA256_HASH_SIZE);
+
     
     // Add peer to network
     NetworkAddress_t* new_peer = (NetworkAddress_t*)malloc(sizeof(NetworkAddress_t));
@@ -256,16 +260,83 @@ static void handle_register_request(int connfd, const char* sender_ip, uint32_t 
 static void handle_retrieve_request(int connfd, const char* sender_ip, uint32_t sender_port,
                                    const hashdata_t sender_signature, const char* body, uint32_t body_len) {
     (void)sender_signature;
-    (void)body;
-    (void)body_len;
 
-    printf("RETRIEVE from %s:%u - Basic implementation\n", sender_ip, sender_port);
+    printf("RETRIEVE from %s:%u\n", sender_ip, sender_port);
 
-    
-    // For now, just send a simple response
-    const char* response_msg = "File retrieval not fully implemented yet";
-    send_reply(connfd, STATUS_OK, response_msg, strlen(response_msg));
+    if (body_len == 0 || body == NULL) {
+        send_error_reply(connfd, STATUS_MALFORMED, "Empty RETRIEVE request");
+        return;
+    }
+
+    // Filnavnet kommer som rå bytes i body (uden '\0')
+    // Vi laver en kopi med '\0' til fopen.
+    char filename[256];
+    if (body_len >= sizeof(filename)) {
+        send_error_reply(connfd, STATUS_MALFORMED, "Filename too long");
+        return;
+    }
+
+    memcpy(filename, body, body_len);
+    filename[body_len] = '\0';
+
+    printf("RETRIEVE requested filename: '%s'\n", filename);
+
+    // Forsøg at åbne filen (fra nuværende directory / src)
+    FILE *f = fopen(filename, "rb");
+    if (!f) {
+        perror("fopen (RETRIEVE)");
+        send_error_reply(connfd, STATUS_OTHER, "File not found");
+        return;
+    }
+
+    // Find filstørrelse
+    if (fseek(f, 0, SEEK_END) != 0) {
+        perror("fseek");
+        fclose(f);
+        send_error_reply(connfd, STATUS_OTHER, "Failed to read file");
+        return;
+    }
+
+    long fsize = ftell(f);
+    if (fsize < 0) {
+        perror("ftell");
+        fclose(f);
+        send_error_reply(connfd, STATUS_OTHER, "Failed to read file size");
+        return;
+    }
+    rewind(f);
+
+    if (fsize == 0) {
+        // Tom fil – send bare en OK med tom body
+        fclose(f);
+        send_reply(connfd, STATUS_OK, NULL, 0);
+        return;
+    }
+
+    // Læs hele filen i memory (enkelt-block løsning)
+    char *filebuf = (char*)malloc((size_t)fsize);
+    if (!filebuf) {
+        fclose(f);
+        send_error_reply(connfd, STATUS_OTHER, "Memory allocation failed");
+        return;
+    }
+
+    size_t read_bytes = fread(filebuf, 1, (size_t)fsize, f);
+    fclose(f);
+
+    if (read_bytes != (size_t)fsize) {
+        free(filebuf);
+        send_error_reply(connfd, STATUS_OTHER, "Failed to read entire file");
+        return;
+    }
+
+    // Send filens indhold som ét svar-block
+    send_reply(connfd, STATUS_OK, filebuf, (uint32_t)fsize);
+    free(filebuf);
+
+    printf("RETRIEVE: sent file '%s' (%ld bytes)\n", filename, fsize);
 }
+
 
 /*
  * Handler for INFORM requests
@@ -346,6 +417,49 @@ static void handle_inform_request(int connfd, const char* sender_ip, uint32_t se
 static int perform_register(const NetworkAddress_t *peer_address);
 static void update_network_from_register_response(const char *body, uint32_t body_len);
 
+// New helpers for RETRIEVE
+static int pick_random_peer(NetworkAddress_t *out_peer);
+static int perform_retrieve(const NetworkAddress_t *peer_address, const char *filepath);
+
+
+
+// Pick a random peer from the global network (excluding ourselves).
+// Returns 0 on success and writes result into out_peer.
+// Returns -1 if no suitable peer exists.
+static int pick_random_peer(NetworkAddress_t *out_peer) {
+    pthread_mutex_lock(&network_mutex);
+
+    if (peer_count == 0) {
+        pthread_mutex_unlock(&network_mutex);
+        return -1;
+    }
+
+    // Saml kandidater som ikke er os selv
+    uint32_t indices[peer_count];
+    uint32_t candidate_count = 0;
+
+    for (uint32_t i = 0; i < peer_count; i++) {
+        if (network[i]->port == my_address->port &&
+            strncmp(network[i]->ip, my_address->ip, IP_LEN) == 0) {
+            continue; // spring os selv over
+        }
+        indices[candidate_count++] = i;
+    }
+
+    if (candidate_count == 0) {
+        pthread_mutex_unlock(&network_mutex);
+        return -1; // ingen andre peers
+    }
+
+    // Vælg en tilfældig index blandt kandidaterne
+    uint32_t chosen = indices[rand() % candidate_count];
+    memcpy(out_peer, network[chosen], sizeof(NetworkAddress_t));
+
+    pthread_mutex_unlock(&network_mutex);
+    return 0;
+}
+
+
 
 /*
  * Function to act as thread for all required client interactions. This thread 
@@ -380,7 +494,7 @@ void* client_thread() {
     memcpy(peer_address.ip, peer_ip, IP_LEN);
     peer_address.port = atoi(peer_port);
 
-    // --- Our main implemented behaviour: REGISTER with the chosen peer ---
+    // --- REGISTER med den angivne peer ---
     if (perform_register(&peer_address) == 0) {
         fprintf(stdout,
                 "REGISTER succeeded with %s:%d. Known peers now: %u\n",
@@ -389,19 +503,44 @@ void* client_thread() {
         fprintf(stderr,
                 "REGISTER failed with %s:%d\n",
                 peer_address.ip, peer_address.port);
+        printf("Client thread done\n");
+        return NULL;
     }
 
-    // In a full implementation, after registration we would:
-    //  - repeatedly ask for filenames
-    //  - send RETRIEVE requests to random peers from `network`
-    //  - write received files to the src/ directory
-    //
-    // For now we just terminate the client thread.
-    // (You should not see this in the final solution, but it is useful while developing.)
-    printf("Client thread done\n");
+    // --- Enkel RETRIEVE-loop (kan ændres senere) ---
+    while (1) {
+        char filepath[256];
 
+        fprintf(stdout, "Enter file path to RETRIEVE (or 'quit' to exit): ");
+        if (scanf("%255s", filepath) != 1) {
+            break;
+        }
+
+        if (strcmp(filepath, "quit") == 0) {
+            break;
+        }
+
+        NetworkAddress_t target;
+        if (pick_random_peer(&target) != 0) {
+            fprintf(stderr, "No other peers available to retrieve from.\n");
+            continue;
+        }
+
+        if (perform_retrieve(&target, filepath) == 0) {
+            fprintf(stdout,
+                    "RETRIEVE from %s:%d succeeded for '%s'\n",
+                    target.ip, target.port, filepath);
+        } else {
+            fprintf(stderr,
+                    "RETRIEVE from %s:%d failed for '%s'\n",
+                    target.ip, target.port, filepath);
+        }
+    }
+
+    printf("Client thread done\n");
     return NULL;
 }
+
 
 /*
  * Function to act as basis for running the server thread. This thread will be
@@ -751,6 +890,165 @@ static int perform_register(const NetworkAddress_t *peer_address) {
     return 0;
 }
 
+
+// ---------------------------------------------------------------------------
+//  Client-side RETRIEVE (basic stub)
+// ---------------------------------------------------------------------------
+static int perform_retrieve(const NetworkAddress_t *peer_address, const char *filepath) {
+    int sockfd = socket(AF_INET, SOCK_STREAM, 0);
+    if (sockfd < 0) {
+        perror("socket (RETRIEVE)");
+        return -1;
+    }
+
+    struct sockaddr_in servaddr;
+    memset(&servaddr, 0, sizeof(servaddr));
+    servaddr.sin_family = AF_INET;
+    servaddr.sin_port = htons((uint16_t)peer_address->port);
+
+    if (inet_pton(AF_INET, peer_address->ip, &servaddr.sin_addr) <= 0) {
+        fprintf(stderr, "Invalid peer IP address (RETRIEVE): %s\n", peer_address->ip);
+        close(sockfd);
+        return -1;
+    }
+
+    if (connect(sockfd, (struct sockaddr*)&servaddr, sizeof(servaddr)) < 0) {
+        perror("connect (RETRIEVE)");
+        close(sockfd);
+        return -1;
+    }
+
+    // Byg RETRIEVE request header
+    char header[REQUEST_HEADER_LEN];
+    memset(header, 0, sizeof(header));
+
+    // IP (16 bytes)
+    size_t ip_len = strnlen(my_address->ip, IP_LEN);
+    memcpy(header, my_address->ip, ip_len);
+
+    // Port (4 bytes, netværks-byte-order)
+    uint32_t port_net = htonl((uint32_t)my_address->port);
+    memcpy(header + IP_LEN, &port_net, sizeof(port_net));
+
+    // Signature (32 bytes)
+    memcpy(header + IP_LEN + 4, my_address->signature, SHA256_HASH_SIZE);
+
+    // Command = COMMAND_RETREIVE (typisk 2 ifølge spec)
+    uint32_t cmd_net = htonl((uint32_t)COMMAND_RETREIVE);
+    memcpy(header + IP_LEN + 4 + SHA256_HASH_SIZE, &cmd_net, sizeof(cmd_net));
+
+    // Body = filepath som bytes (uden '\0')
+    size_t name_len = strnlen(filepath, 255);
+    uint32_t body_len = (uint32_t)name_len;
+    uint32_t bodylen_net = htonl(body_len);
+    memcpy(header + IP_LEN + 4 + SHA256_HASH_SIZE + 4, &bodylen_net, sizeof(bodylen_net));
+
+    // Send header
+    ssize_t written = compsys_helper_writen(sockfd, header, REQUEST_HEADER_LEN);
+    if (written != REQUEST_HEADER_LEN) {
+        perror("compsys_helper_writen (RETRIEVE header)");
+        close(sockfd);
+        return -1;
+    }
+
+    // Send body (filnavn)
+    if (body_len > 0) {
+        written = compsys_helper_writen(sockfd, (void*)filepath, body_len);
+        if (written != (ssize_t)body_len) {
+            perror("compsys_helper_writen (RETRIEVE body)");
+            close(sockfd);
+            return -1;
+        }
+    }
+
+
+    // Læs svar-header (samme format som REGISTER)
+    unsigned char resp_hdr[REPLY_HEADER_LEN];
+    ssize_t read_bytes = compsys_helper_readn(sockfd, resp_hdr, REPLY_HEADER_LEN);
+    if (read_bytes != REPLY_HEADER_LEN) {
+        perror("compsys_helper_readn (RETRIEVE response header)");
+        close(sockfd);
+        return -1;
+    }
+
+    uint32_t resp_body_len_net;
+    uint32_t status_net;
+    uint32_t block_num_net;
+    uint32_t block_count_net;
+
+    memcpy(&resp_body_len_net, resp_hdr + 0, 4);
+    memcpy(&status_net,        resp_hdr + 4, 4);
+    memcpy(&block_num_net,     resp_hdr + 8, 4);
+    memcpy(&block_count_net,   resp_hdr + 12, 4);
+
+    uint32_t resp_body_len = ntohl(resp_body_len_net);
+    uint32_t status         = ntohl(status_net);
+    uint32_t block_num      = ntohl(block_num_net);
+    uint32_t block_count    = ntohl(block_count_net);
+
+    if (status != STATUS_OK) {
+        fprintf(stderr, "RETRIEVE failed, status = %u\n", status);
+        // læs og kassér body hvis der er en fejlbesked
+        if (resp_body_len > 0) {
+            char *dummy = (char*)malloc(resp_body_len);
+            if (dummy) {
+                compsys_helper_readn(sockfd, dummy, resp_body_len);
+                free(dummy);
+            }
+        }
+        close(sockfd);
+        return -1;
+    }
+
+    // For nu håndterer vi kun single-block svar (ligesom REGISTER)
+    if (block_count != 1 || block_num != 0) {
+        fprintf(stderr,
+                "Multi-block RETRIEVE response not yet supported "
+                "(block_num=%u, block_count=%u)\n",
+                block_num, block_count);
+        if (resp_body_len > 0) {
+            char *dummy = (char*)malloc(resp_body_len);
+            if (dummy) {
+                compsys_helper_readn(sockfd, dummy, resp_body_len);
+                free(dummy);
+            }
+        }
+        close(sockfd);
+        return -1;
+    }
+
+    if (resp_body_len > 0) {
+        char *body = (char*)malloc(resp_body_len + 1);
+        if (!body) {
+            fprintf(stderr, "malloc failed for RETRIEVE body\n");
+            close(sockfd);
+            return -1;
+        }
+
+        read_bytes = compsys_helper_readn(sockfd, body, resp_body_len);
+        if (read_bytes != (ssize_t)resp_body_len) {
+            perror("compsys_helper_readn (RETRIEVE body)");
+            free(body);
+            close(sockfd);
+            return -1;
+        }
+
+        // midlertidigt: print kun længden, ikke gem filen rigtigt
+        body[resp_body_len] = '\0';
+        printf("RETRIEVE: received %u bytes of data\n", resp_body_len);
+        // TODO (for gruppen): skriv body til fil i src/-mappen
+
+        free(body);
+    } else {
+        printf("RETRIEVE: response body is empty\n");
+    }
+
+    close(sockfd);
+    return 0;
+}
+
+
+
 // Parse the REGISTER response body into the global `network[]` list.
 // Body is a list of entries, each 68 bytes:
 //   16 bytes - IP
@@ -869,6 +1167,10 @@ int main(int argc, char **argv) {
         exit(EXIT_FAILURE);
     }
 
+    // Seed random once (for pick_random_peer)
+    srand((unsigned int)time(NULL));
+
+
     char password[PASSWORD_LEN];
     fprintf(stdout, "Create a password to proceed: ");
     scanf("%16s", password);
@@ -878,11 +1180,12 @@ int main(int argc, char **argv) {
         password[i] = '\0';
     }
 
-    // For debugging, we use a fixed salt. (Spec suggests random salt in practice.)
-    char salt[SALT_LEN] = "0123456789ABCDEF";
-    // generate_random_salt(salt);  // optional improvement
-    memcpy(my_address->salt, salt, SALT_LEN);
-    
+    // For debugging, we use a fixed salt of exactly SALT_LEN bytes (no '\0').
+    // We use a string literal as source but only copy the first SALT_LEN bytes.
+    char fixed_salt_str[] = "0123456789ABCDEF"; // 16 visible chars + '\0' in memory
+    memcpy(my_address->salt, fixed_salt_str, SALT_LEN);
+    // (Alternativt i den endelige løsning: generate_random_salt(my_address->salt);)
+
     // Compute this peer's signature = SHA256(password || salt)
     hashdata_t my_signature;
     assemble_signature(password, my_address->salt, my_signature);
@@ -923,3 +1226,4 @@ int main(int argc, char **argv) {
 
     exit(EXIT_SUCCESS);
 }
+
