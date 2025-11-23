@@ -7,6 +7,7 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+#include <pthread.h>
 
 #ifdef __APPLE__
 #include "./endian.h"
@@ -16,9 +17,7 @@
 
 #include "./peer.h"
 
-
 // Global variables to be used by both the server and client side of the peer.
-// Note the addition of mutexs to prevent race conditions.
 NetworkAddress_t *my_address;
 
 NetworkAddress_t** network = NULL;
@@ -31,10 +30,9 @@ pthread_mutex_t network_mutex = PTHREAD_MUTEX_INITIALIZER;
 void* connection_handler(void *arg);
 
 // We might later need a list of files currently being retrieved,
-// but we can add that when we implement RETREIVE.
+// but we can add that when we implement RETRIEVE.
 
 // --- Helper: compute signature = SHA256(password || salt) ---
-
 static void assemble_signature(const char *password, const char *salt, hashdata_t out) {
     // password: up to PASSWORD_LEN chars (may contain '\0' after scanf)
     // salt:     exactly SALT_LEN chars (not necessarily '\0'-terminated)
@@ -56,35 +54,37 @@ static void assemble_signature(const char *password, const char *salt, hashdata_
 }
 
 // STATIC HELPER FUNCTIONS FOR REQUEST HANDLING
-/*
- * Send a reply to the client (basic single-block version)
- */
-static void send_reply(int connfd, uint32_t status, const void* data, uint32_t data_len) {
+//
+static void send_reply(int connfd, uint32_t status, uint32_t block_number,
+                       uint32_t block_count, const void* data, uint32_t data_len,
+                       const hashdata_t block_hash, const hashdata_t total_hash) {
     ReplyHeader_t header;
     memset(&header, 0, sizeof(header));
-    
+
     header.length = htonl(data_len);
     header.status = htonl(status);
-    header.this_block = htonl(0);  // Single block
-    header.block_count = htonl(1); // Total blocks
-    
-    // Calculate hashes
-    if (data && data_len > 0) {
-        get_data_sha(data, header.block_hash, data_len, SHA256_HASH_SIZE);
-        get_data_sha(data, header.total_hash, data_len, SHA256_HASH_SIZE);
+    header.this_block = htonl(block_number);
+    header.block_count = htonl(block_count);
+
+    if (block_hash) {
+        memcpy(header.block_hash, block_hash, SHA256_HASH_SIZE);
     } else {
-        // For empty data, use hash of empty string
         get_data_sha("", header.block_hash, 0, SHA256_HASH_SIZE);
+    }
+
+    if (total_hash) {
+        memcpy(header.total_hash, total_hash, SHA256_HASH_SIZE);
+    } else {
         get_data_sha("", header.total_hash, 0, SHA256_HASH_SIZE);
     }
-    
+
     // Send header
     ssize_t written = compsys_helper_writen(connfd, &header, REPLY_HEADER_LEN);
     if (written != REPLY_HEADER_LEN) {
         perror("Failed to write reply header");
         return;
     }
-    
+
     // Send data if present
     if (data && data_len > 0) {
         written = compsys_helper_writen(connfd, (void*)data, data_len);
@@ -92,67 +92,157 @@ static void send_reply(int connfd, uint32_t status, const void* data, uint32_t d
             perror("Failed to write reply data");
         }
     }
-    
-    printf("Sent reply: status=%u, data_len=%u\n", status, data_len);
+
+    // Debug
+    printf("Sent reply: status=%u, block=%u/%u, data_len=%u\n",
+           status, block_number, block_count, data_len);
 }
 
-/*
- * Send an error reply to the client
- */
+//
 static void send_error_reply(int connfd, uint32_t status, const char* message) {
     printf("Sending error reply: status=%u, message=%s\n", status, message);
-    
+
     // Convert message to bytes
     size_t msg_len = strlen(message);
     char* msg_bytes = (char*)malloc(msg_len);
     if (msg_bytes) {
         memcpy(msg_bytes, message, msg_len);
-        send_reply(connfd, status, msg_bytes, msg_len);
+        // For errors treat as single-block
+        hashdata_t h;
+        get_data_sha(msg_bytes, h, (uint32_t)msg_len, SHA256_HASH_SIZE);
+        send_reply(connfd, status, 0, 1, msg_bytes, (uint32_t)msg_len, h, h);
         free(msg_bytes);
     } else {
         // Fallback: send empty reply with error status
-        send_reply(connfd, status, NULL, 0);
+        hashdata_t h;
+        get_data_sha("", h, 0, SHA256_HASH_SIZE);
+        send_reply(connfd, status, 0, 1, NULL, 0, h, h);
     }
 }
 
-/*
- * Handler for REGISTER requests
- */
-static void handle_register_request(int connfd, const char* sender_ip, uint32_t sender_port, 
+//
+static int find_peer_index(const char* ip, uint32_t port) {
+    for (uint32_t i = 0; i < peer_count; i++) {
+        if (network[i]->port == (int)port &&
+            strncmp(network[i]->ip, ip, IP_LEN) == 0) {
+            return (int)i;
+        }
+    }
+    return -1;
+}
+
+//
+static void send_inform_to_peer(const NetworkAddress_t *dest, const NetworkAddress_t *new_peer_info) {
+    int sockfd = socket(AF_INET, SOCK_STREAM, 0);
+    if (sockfd < 0) {
+        perror("socket (INFORM)");
+        return;
+    }
+
+    struct sockaddr_in servaddr;
+    memset(&servaddr, 0, sizeof(servaddr));
+    servaddr.sin_family = AF_INET;
+    servaddr.sin_port = htons((uint16_t)dest->port);
+
+    if (inet_pton(AF_INET, dest->ip, &servaddr.sin_addr) <= 0) {
+        fprintf(stderr, "Invalid peer IP address (INFORM): %s\n", dest->ip);
+        close(sockfd);
+        return;
+    }
+
+    if (connect(sockfd, (struct sockaddr*)&servaddr, sizeof(servaddr)) < 0) {
+        // Non-fatal: remote peer may be down
+        // Don't perror repeatedly
+        // perror("connect (INFORM)");
+        close(sockfd);
+        return;
+    }
+
+    // Build request header
+    char header[REQUEST_HEADER_LEN];
+    memset(header, 0, sizeof(header));
+
+    // IP (16 bytes)
+    size_t ip_len = strnlen(my_address->ip, IP_LEN);
+    memcpy(header, my_address->ip, ip_len);
+
+    // Port
+    uint32_t port_net = htonl((uint32_t)my_address->port);
+    memcpy(header + IP_LEN, &port_net, sizeof(port_net));
+
+    // Signature
+    memcpy(header + IP_LEN + PORT_LEN, my_address->signature, SHA256_HASH_SIZE);
+
+    // Command = INFORM
+    uint32_t cmd_net = htonl((uint32_t)COMMAND_INFORM);
+    memcpy(header + IP_LEN + PORT_LEN + SHA256_HASH_SIZE, &cmd_net, sizeof(cmd_net));
+
+    // Body length = PEER_ADDR_LEN
+    uint32_t bodylen_net = htonl((uint32_t)PEER_ADDR_LEN);
+    memcpy(header + IP_LEN + PORT_LEN + SHA256_HASH_SIZE + LEN_COMMAND_LENGTH, &bodylen_net, sizeof(bodylen_net));
+
+    // Send header
+    ssize_t written = compsys_helper_writen(sockfd, header, REQUEST_HEADER_LEN);
+    if (written != REQUEST_HEADER_LEN) {
+        // perror("compsys_helper_writen (INFORM header)");
+        close(sockfd);
+        return;
+    }
+
+    // Build body: 16 bytes IP, 4 bytes port (network order), 32 bytes signature, 16 bytes salt
+    char body[PEER_ADDR_LEN];
+    memset(body, 0, sizeof(body));
+    memcpy(body, new_peer_info->ip, IP_LEN);
+    uint32_t newport_net = htonl((uint32_t)new_peer_info->port);
+    memcpy(body + IP_LEN, &newport_net, sizeof(newport_net));
+    memcpy(body + IP_LEN + PORT_LEN, new_peer_info->signature, SHA256_HASH_SIZE);
+    memcpy(body + IP_LEN + PORT_LEN + SHA256_HASH_SIZE, new_peer_info->salt, SALT_LEN);
+
+    // Send body
+    written = compsys_helper_writen(sockfd, body, PEER_ADDR_LEN);
+    // We don't expect a reply to INFORM
+    close(sockfd);
+}
+
+//
+static void handle_register_request(int connfd, const char* sender_ip, uint32_t sender_port,
                                    const hashdata_t sender_signature, const char* body, uint32_t body_len) {
     (void)body;
     (void)body_len;
-    
+
     printf("REGISTER from %s:%u\n", sender_ip, sender_port);
-    
-    // Check if peer already exists
-    char sender_address[50];
-    snprintf(sender_address, sizeof(sender_address), "%s:%u", sender_ip, sender_port);
-    
+
+    // Lock network while checking/adding
     pthread_mutex_lock(&network_mutex);
-    
-    // Check if peer already exists
-    int peer_exists = 0;
-    for (uint32_t i = 0; i < peer_count; i++) {
-        char existing_address[50];
-        snprintf(existing_address, sizeof(existing_address), "%s:%d", 
-                 network[i]->ip, network[i]->port);
-        if (strcmp(sender_address, existing_address) == 0) {
-            peer_exists = 1;
-            break;
+
+    // Check if peer already exists (by ip+port)
+    int existing_idx = find_peer_index(sender_ip, sender_port);
+
+    if (existing_idx >= 0) {
+        // Peer exists: verify password (signature) matches
+        // saved_signature == SHA256( client_signature || saved_salt )
+        hashdata_t rehashed;
+        char combined[SHA256_HASH_SIZE + SALT_LEN];
+        memcpy(combined, sender_signature, SHA256_HASH_SIZE);
+        memcpy(combined + SHA256_HASH_SIZE, network[existing_idx]->salt, SALT_LEN);
+        get_data_sha(combined, rehashed, SHA256_HASH_SIZE + SALT_LEN, SHA256_HASH_SIZE);
+
+        if (memcmp(rehashed, network[existing_idx]->signature, SHA256_HASH_SIZE) != 0) {
+            pthread_mutex_unlock(&network_mutex);
+            send_error_reply(connfd, STATUS_BAD_PASSWORD, "Password mismatch");
+            return;
+        } else {
+            // Peer registering again but same credentials -> send PEER_EXISTS (status 2)
+            pthread_mutex_unlock(&network_mutex);
+            send_error_reply(connfd, STATUS_PEER_EXISTS, "Peer already registered");
+            return;
         }
     }
-    
-    if (peer_exists) {
-        pthread_mutex_unlock(&network_mutex);
-        send_error_reply(connfd, STATUS_PEER_EXISTS, "Peer already registered");
-        return;
-    }
-    
+
     // Generate salt for the new peer
     char salt[SALT_LEN];
     generate_random_salt(salt);
-    
+
     // Calculate saveable signature (SHA256(sender_signature || salt))
     hashdata_t saveable_sig;
     char combined[SHA256_HASH_SIZE + SALT_LEN];
@@ -163,17 +253,21 @@ static void handle_register_request(int connfd, const char* sender_ip, uint32_t 
     get_data_sha(combined, saveable_sig,
                 SHA256_HASH_SIZE + SALT_LEN, SHA256_HASH_SIZE);
 
-    
     // Add peer to network
     NetworkAddress_t* new_peer = (NetworkAddress_t*)malloc(sizeof(NetworkAddress_t));
+    if (!new_peer) {
+        pthread_mutex_unlock(&network_mutex);
+        send_error_reply(connfd, STATUS_OTHER, "Memory allocation failed");
+        return;
+    }
     memset(new_peer, 0, sizeof(NetworkAddress_t));
     strncpy(new_peer->ip, sender_ip, IP_LEN);
+    new_peer->ip[IP_LEN-1] = '\0';
     new_peer->port = sender_port;
     memcpy(new_peer->signature, saveable_sig, SHA256_HASH_SIZE);
     memcpy(new_peer->salt, salt, SALT_LEN);
-    
-    // Reallocate network array
-    NetworkAddress_t** new_network = (NetworkAddress_t**)realloc(network, 
+
+    NetworkAddress_t** new_network = (NetworkAddress_t**)realloc(network,
                                         (peer_count + 1) * sizeof(NetworkAddress_t*));
     if (!new_network) {
         free(new_peer);
@@ -181,86 +275,91 @@ static void handle_register_request(int connfd, const char* sender_ip, uint32_t 
         send_error_reply(connfd, STATUS_OTHER, "Memory allocation failed");
         return;
     }
-    
+
     network = new_network;
     network[peer_count] = new_peer;
     peer_count++;
-    
-    printf("Registered new peer: %s. Total peers in network: %u\n", sender_address, peer_count);
-    
-    // Debug: print all peers in network
-    printf("DEBUG: Current network peers:\n");
-    for (uint32_t i = 0; i < peer_count; i++) {
-        printf("  Peer %u: %s:%d\n", i, network[i]->ip, network[i]->port);
-    }
-    
-    // Count how many peers we will send (excluding the new peer)
+
+    printf("Registered new peer: %s:%u. Total peers in network: %u\n", sender_ip, sender_port, peer_count);
+
+    // Prepare response body: list of peers excluding the newly added peer
     uint32_t peers_to_send = 0;
     for (uint32_t i = 0; i < peer_count; i++) {
-        if (network[i]->port == sender_port && 
-            strncmp(network[i]->ip, sender_ip, IP_LEN) == 0) {
-            continue; // Skip the new peer
+        if (network[i]->port == new_peer->port &&
+            strncmp(network[i]->ip, new_peer->ip, IP_LEN) == 0) {
+            continue;
         }
         peers_to_send++;
     }
-    
+
     uint32_t response_size = peers_to_send * PEER_ADDR_LEN;
-    printf("DEBUG: Will send %u peers in response (%u bytes)\n", peers_to_send, response_size);
-    
-    char* response_data = (char*)malloc(response_size);
-    if (!response_data) {
-        pthread_mutex_unlock(&network_mutex);
-        send_error_reply(connfd, STATUS_OTHER, "Memory allocation failed");
-        return;
+    char* response_data = NULL;
+    if (response_size > 0) {
+        response_data = (char*)malloc(response_size);
+        if (!response_data) {
+            pthread_mutex_unlock(&network_mutex);
+            send_error_reply(connfd, STATUS_OTHER, "Memory allocation failed");
+            return;
+        }
+
+        char* current_pos = response_data;
+        for (uint32_t i = 0; i < peer_count; i++) {
+            if (network[i]->port == new_peer->port &&
+                strncmp(network[i]->ip, new_peer->ip, IP_LEN) == 0) {
+                continue;
+            }
+            // IP
+            strncpy(current_pos, network[i]->ip, IP_LEN);
+            current_pos += IP_LEN;
+            // Port
+            uint32_t port_net = htonl(network[i]->port);
+            memcpy(current_pos, &port_net, sizeof(port_net));
+            current_pos += sizeof(port_net);
+            // Signature
+            memcpy(current_pos, network[i]->signature, SHA256_HASH_SIZE);
+            current_pos += SHA256_HASH_SIZE;
+            // Salt
+            memcpy(current_pos, network[i]->salt, SALT_LEN);
+            current_pos += SALT_LEN;
+        }
     }
-    
-    char* current_pos = response_data;
-    
-    // Add all peers except the new one
+
+    // Unlock before sending replies and broadcasting
+    pthread_mutex_unlock(&network_mutex);
+
+    // Send OK reply with peer list (as a single block)
+    hashdata_t body_hash;
+    if (response_size > 0)
+        get_data_sha(response_data, body_hash, response_size, SHA256_HASH_SIZE);
+    else
+        get_data_sha("", body_hash, 0, SHA256_HASH_SIZE);
+
+    send_reply(connfd, STATUS_OK, 0, 1, response_data, response_size, body_hash, body_hash);
+    if (response_data) free(response_data);
+
+    // INFORM-broadcast the new peer to all other peers (best-effort)
+    pthread_mutex_lock(&network_mutex);
     for (uint32_t i = 0; i < peer_count; i++) {
-        // Skip the new peer we just added
-        if (network[i]->port == sender_port && 
-            strncmp(network[i]->ip, sender_ip, IP_LEN) == 0) {
+        // Skip the new peer itself and ourselves
+        if (network[i]->port == new_peer->port &&
+            strncmp(network[i]->ip, new_peer->ip, IP_LEN) == 0) {
             continue;
         }
-        
-        printf("DEBUG: Adding peer to response: %s:%d\n", network[i]->ip, network[i]->port);
-        
-        // IP (16 bytes)
-        strncpy(current_pos, network[i]->ip, IP_LEN);
-        current_pos += IP_LEN;
-        
-        // Port (4 bytes, network order)
-        uint32_t port_net = htonl(network[i]->port);
-        memcpy(current_pos, &port_net, sizeof(port_net));
-        current_pos += sizeof(port_net);
-        
-        // Signature (32 bytes)
-        memcpy(current_pos, network[i]->signature, SHA256_HASH_SIZE);
-        current_pos += SHA256_HASH_SIZE;
-        
-        // Salt (16 bytes)
-        memcpy(current_pos, network[i]->salt, SALT_LEN);
-        current_pos += SALT_LEN;
+        if (network[i]->port == my_address->port &&
+            strncmp(network[i]->ip, my_address->ip, IP_LEN) == 0) {
+            continue;
+        }
+        // Fire-and-forget (could be threaded; kept simple)
+        send_inform_to_peer(network[i], new_peer);
     }
-    
     pthread_mutex_unlock(&network_mutex);
-    
-    // Send successful response with peer list (excluding the new peer)
-    send_reply(connfd, STATUS_OK, response_data, response_size);
-    free(response_data);
-    
-    printf("Registration successful for %s, sent %u peers in response\n", 
-           sender_address, peers_to_send);
+
+    printf("Registration successful for %s:%u\n", sender_ip, sender_port);
 }
 
-/*
- * Handler for RETRIEVE requests  
- */
+//
 static void handle_retrieve_request(int connfd, const char* sender_ip, uint32_t sender_port,
                                    const hashdata_t sender_signature, const char* body, uint32_t body_len) {
-    (void)sender_signature;
-
     printf("RETRIEVE from %s:%u\n", sender_ip, sender_port);
 
     if (body_len == 0 || body == NULL) {
@@ -268,9 +367,32 @@ static void handle_retrieve_request(int connfd, const char* sender_ip, uint32_t 
         return;
     }
 
+    // Verify peer is registered
+    pthread_mutex_lock(&network_mutex);
+    int idx = find_peer_index(sender_ip, sender_port);
+    if (idx < 0) {
+        pthread_mutex_unlock(&network_mutex);
+        send_error_reply(connfd, STATUS_PEER_MISSING, "Peer not registered");
+        return;
+    }
+
+    // Verify signature: saved_signature == SHA256(sender_signature || saved_salt)
+    hashdata_t rehashed;
+    char comb[SHA256_HASH_SIZE + SALT_LEN];
+    memcpy(comb, sender_signature, SHA256_HASH_SIZE);
+    memcpy(comb + SHA256_HASH_SIZE, network[idx]->salt, SALT_LEN);
+    get_data_sha(comb, rehashed, SHA256_HASH_SIZE + SALT_LEN, SHA256_HASH_SIZE);
+
+    if (memcmp(rehashed, network[idx]->signature, SHA256_HASH_SIZE) != 0) {
+        pthread_mutex_unlock(&network_mutex);
+        send_error_reply(connfd, STATUS_BAD_PASSWORD, "Password mismatch");
+        return;
+    }
+    pthread_mutex_unlock(&network_mutex);
+
     // Filnavnet kommer som rå bytes i body (uden '\0')
     // Vi laver en kopi med '\0' til fopen.
-    char filename[256];
+    char filename[512];
     if (body_len >= sizeof(filename)) {
         send_error_reply(connfd, STATUS_MALFORMED, "Filename too long");
         return;
@@ -281,11 +403,11 @@ static void handle_retrieve_request(int connfd, const char* sender_ip, uint32_t 
 
     printf("RETRIEVE requested filename: '%s'\n", filename);
 
-    // Forsøg at åbne filen (fra nuværende directory / src)
+    // Forsøg at åbne filen (fra nuværende directory)
     FILE *f = fopen(filename, "rb");
     if (!f) {
         perror("fopen (RETRIEVE)");
-        send_error_reply(connfd, STATUS_OTHER, "File not found");
+        send_error_reply(connfd, STATUS_BAD_REQUEST, "File not found");
         return;
     }
 
@@ -307,13 +429,16 @@ static void handle_retrieve_request(int connfd, const char* sender_ip, uint32_t 
     rewind(f);
 
     if (fsize == 0) {
-        // Tom fil – send bare en OK med tom body
+        // Tom fil – send bare en OK med tom body (single block)
         fclose(f);
-        send_reply(connfd, STATUS_OK, NULL, 0);
+        hashdata_t empty_hash;
+        get_data_sha("", empty_hash, 0, SHA256_HASH_SIZE);
+        send_reply(connfd, STATUS_OK, 0, 1, NULL, 0, empty_hash, empty_hash);
         return;
     }
 
-    // Læs hele filen i memory (enkelt-block løsning)
+    // Læs hele filen i memory (for at lave total-hash). Hvis fil er for stor, vi kan stadig streame.
+    // Her antager vi at memory er tilgængelig (typisk ok). Alternativt kan man beregne total-hash ved streaming.
     char *filebuf = (char*)malloc((size_t)fsize);
     if (!filebuf) {
         fclose(f);
@@ -330,86 +455,112 @@ static void handle_retrieve_request(int connfd, const char* sender_ip, uint32_t 
         return;
     }
 
-    // Send filens indhold som ét svar-block
-    send_reply(connfd, STATUS_OK, filebuf, (uint32_t)fsize);
-    free(filebuf);
+    // Compute total hash
+    hashdata_t total_hash;
+    get_data_sha(filebuf, total_hash, (uint32_t)fsize, SHA256_HASH_SIZE);
 
-    printf("RETRIEVE: sent file '%s' (%ld bytes)\n", filename, fsize);
+    // Determine chunk size: messages limited to MAX_MSG_LEN including header
+    uint32_t max_body_per_msg = MAX_MSG_LEN - REPLY_HEADER_LEN;
+    if (max_body_per_msg == 0) {
+        free(filebuf);
+        send_error_reply(connfd, STATUS_OTHER, "Max message size configuration error");
+        return;
+    }
+
+    uint32_t block_count = (uint32_t)((fsize + max_body_per_msg - 1) / max_body_per_msg);
+
+    // Send each block
+    for (uint32_t block = 0; block < block_count; block++) {
+        uint32_t offset = block * max_body_per_msg;
+        uint32_t to_send = (uint32_t)fsize - offset;
+        if (to_send > max_body_per_msg) to_send = max_body_per_msg;
+
+        hashdata_t block_hash;
+        get_data_sha(filebuf + offset, block_hash, to_send, SHA256_HASH_SIZE);
+
+        send_reply(connfd, STATUS_OK, block, block_count, filebuf + offset, to_send, block_hash, total_hash);
+    }
+
+    free(filebuf);
+    printf("RETRIEVE: sent file '%s' in %u blocks\n", filename, block_count);
 }
 
-
-/*
- * Handler for INFORM requests
- */
+//
 static void handle_inform_request(int connfd, const char* sender_ip, uint32_t sender_port,
                                  const hashdata_t sender_signature, const char* body, uint32_t body_len) {
     (void)connfd;
     (void)sender_signature;
 
     printf("INFORM from %s:%u - Basic implementation\n", sender_ip, sender_port);
-    
+
     // INFORM doesn't expect a reply according to protocol
     // Just parse the body and add the peer to our network
-    
+
     if (body_len != PEER_ADDR_LEN) {
         fprintf(stderr, "INFORM message has wrong size: %u (expected %d)\n", body_len, PEER_ADDR_LEN);
         return;
     }
-    
+
     // Parse the inform message (68 bytes: IP + port + signature + salt)
     char new_ip[IP_LEN];
     uint32_t new_port_net, new_port;
     hashdata_t new_signature;
     char new_salt[SALT_LEN];
-    
+
     memcpy(new_ip, body, IP_LEN);
     new_ip[IP_LEN - 1] = '\0';
-    
+
     memcpy(&new_port_net, body + IP_LEN, sizeof(new_port_net));
     new_port = ntohl(new_port_net);
-    
+
     memcpy(new_signature, body + IP_LEN + PORT_LEN, SHA256_HASH_SIZE);
     memcpy(new_salt, body + IP_LEN + PORT_LEN + SHA256_HASH_SIZE, SALT_LEN);
-    
+
     char new_address[50];
     snprintf(new_address, sizeof(new_address), "%s:%u", new_ip, new_port);
-    
+
     pthread_mutex_lock(&network_mutex);
-    
+
     // Check if peer already exists
     int peer_exists = 0;
     for (uint32_t i = 0; i < peer_count; i++) {
         char existing_address[50];
-        snprintf(existing_address, sizeof(existing_address), "%s:%d", 
+        snprintf(existing_address, sizeof(existing_address), "%s:%d",
                  network[i]->ip, network[i]->port);
         if (strcmp(new_address, existing_address) == 0) {
             peer_exists = 1;
             break;
         }
     }
-    
+
     if (!peer_exists) {
         // Add new peer to network
         NetworkAddress_t* new_peer = (NetworkAddress_t*)malloc(sizeof(NetworkAddress_t));
+        if (!new_peer) {
+            fprintf(stderr, "Failed to allocate new peer in INFORM\n");
+            pthread_mutex_unlock(&network_mutex);
+            return;
+        }
         memset(new_peer, 0, sizeof(NetworkAddress_t));
         strncpy(new_peer->ip, new_ip, IP_LEN);
+        new_peer->ip[IP_LEN-1] = '\0';
         new_peer->port = new_port;
         memcpy(new_peer->signature, new_signature, SHA256_HASH_SIZE);
         memcpy(new_peer->salt, new_salt, SALT_LEN);
-        
-        NetworkAddress_t** new_network = (NetworkAddress_t**)realloc(network, 
+
+        NetworkAddress_t** new_network = (NetworkAddress_t**)realloc(network,
                                             (peer_count + 1) * sizeof(NetworkAddress_t*));
         if (new_network) {
             network = new_network;
             network[peer_count] = new_peer;
             peer_count++;
-            printf("Added peer from INFORM: %s\n", new_address);
+            printf("Added peer from INFORM: %s:%u\n", new_ip, new_port);
         } else {
             free(new_peer);
             fprintf(stderr, "Failed to allocate memory for new peer\n");
         }
     }
-    
+
     pthread_mutex_unlock(&network_mutex);
 }
 
@@ -420,8 +571,6 @@ static void update_network_from_register_response(const char *body, uint32_t bod
 // New helpers for RETRIEVE
 static int pick_random_peer(NetworkAddress_t *out_peer);
 static int perform_retrieve(const NetworkAddress_t *peer_address, const char *filepath);
-
-
 
 // Pick a random peer from the global network (excluding ourselves).
 // Returns 0 on success and writes result into out_peer.
@@ -434,42 +583,31 @@ static int pick_random_peer(NetworkAddress_t *out_peer) {
         return -1;
     }
 
-    // Saml kandidater som ikke er os selv
-    uint32_t indices[peer_count];
-    uint32_t candidate_count = 0;
+    // Collect candidates that are not ourselves
+    uint32_t candidates = 0;
+    uint32_t indices[peer_count ? peer_count : 1];
 
     for (uint32_t i = 0; i < peer_count; i++) {
         if (network[i]->port == my_address->port &&
             strncmp(network[i]->ip, my_address->ip, IP_LEN) == 0) {
-            continue; // spring os selv over
+            continue; // skip ourselves
         }
-        indices[candidate_count++] = i;
+        indices[candidates++] = i;
     }
 
-    if (candidate_count == 0) {
+    if (candidates == 0) {
         pthread_mutex_unlock(&network_mutex);
-        return -1; // ingen andre peers
+        return -1;
     }
 
-    // Vælg en tilfældig index blandt kandidaterne
-    uint32_t chosen = indices[rand() % candidate_count];
+    uint32_t chosen = indices[rand() % candidates];
     memcpy(out_peer, network[chosen], sizeof(NetworkAddress_t));
 
     pthread_mutex_unlock(&network_mutex);
     return 0;
 }
 
-
-
-/*
- * Function to act as thread for all required client interactions. This thread 
- * will be run concurrently with the server_thread. It will start by requesting
- * the IP and port for another peer to connect to. Once both have been provided
- * the thread will register with that peer and expect a response outlining the
- * complete network. The user will then be prompted to provide a file path to
- * retrieve. This file request will be sent to a random peer on the network.
- * This request/retrieve interaction is then repeated forever.
- */ 
+//
 void* client_thread() {
     char peer_ip[IP_LEN];
     fprintf(stdout, "Enter peer IP to connect to: ");
@@ -541,11 +679,7 @@ void* client_thread() {
     return NULL;
 }
 
-
-/*
- * Function to act as basis for running the server thread. This thread will be
- * run concurrently with the client thread, but is infinite in nature.
- */
+//
 void* server_thread() {
     char port_str[PORT_STR_LEN];
 
@@ -597,27 +731,7 @@ void* server_thread() {
     return NULL;
 }
 
-/*
- * This is the per-connection handler for *incoming* requests.
- * Right now it only reads the request header and closes the connection.
- *
- * === TODO FOR TEAM ===
- *  1) Parse the request header in `buffer` into:
- *       - sender_ip[IP_LEN]
- *       - sender_port
- *       - sender_signature[SHA256_HASH_SIZE]
- *       - command (1=REGISTER, 2=RETRIEVE, 3=INFORM)
- *       - body_len
- *  2) Read `body_len` bytes of payload into a separate buffer.
- *  3) Switch on `command`:
- *       - if 1: call a future `handle_register_request(...)`
- *       - if 2: call a future `handle_retrieve_request(...)`
- *       - if 3: call a future `handle_inform_request(...)`
- *  4) Those handler functions must:
- *       - Check passwords/signatures (Section 3.2)
- *       - Update `network` safely using `network_mutex`
- *       - Send appropriate responses using the response format in Section 3.4.
- */
+//
 void* connection_handler(void* arg) {
     int connfd = *(int*)arg;
     free(arg);
@@ -654,7 +768,7 @@ void* connection_handler(void* arg) {
     body_len = ntohl(body_len_net);
 
     // Debug output
-    printf("Incoming request: IP=%s, port=%u, command=%u, body_len=%u\n", 
+    printf("Incoming request: IP=%s, port=%u, command=%u, body_len=%u\n",
            sender_ip, sender_port, command, body_len);
 
     // Read request body if present
@@ -756,12 +870,6 @@ static int perform_register(const NetworkAddress_t *peer_address) {
     }
 
     // 2) Build REGISTER request header (command code 1, no body)
-    // Request format (Section 3.3):
-    //   16 bytes - our IP
-    //   4 bytes  - our port (network order)
-    //   32 bytes - our signature (SHA256 of salted password)
-    //   4 bytes  - command code (1 = REGISTER)
-    //   4 bytes  - body length (0 for REGISTER)
     char header[REQUEST_HEADER_LEN];
     memset(header, 0, sizeof(header));
 
@@ -774,15 +882,15 @@ static int perform_register(const NetworkAddress_t *peer_address) {
     memcpy(header + IP_LEN, &port_net, sizeof(port_net));
 
     // Signature (32 bytes)
-    memcpy(header + IP_LEN + 4, my_address->signature, SHA256_HASH_SIZE);
+    memcpy(header + IP_LEN + PORT_LEN, my_address->signature, SHA256_HASH_SIZE);
 
-    // Command = 1 (REGISTER)
-    uint32_t cmd_net = htonl(1u);
-    memcpy(header + IP_LEN + 4 + SHA256_HASH_SIZE, &cmd_net, sizeof(cmd_net));
+    // Command = COMMAND_REGISTER
+    uint32_t cmd_net = htonl((uint32_t)COMMAND_REGISTER);
+    memcpy(header + IP_LEN + PORT_LEN + SHA256_HASH_SIZE, &cmd_net, sizeof(cmd_net));
 
     // Body length = 0
     uint32_t bodylen_net = htonl(0u);
-    memcpy(header + IP_LEN + 4 + SHA256_HASH_SIZE + 4, &bodylen_net, sizeof(bodylen_net));
+    memcpy(header + IP_LEN + PORT_LEN + SHA256_HASH_SIZE + LEN_COMMAND_LENGTH, &bodylen_net, sizeof(bodylen_net));
 
     // Send header (no body)
     ssize_t written = compsys_helper_writen(sockfd, header, REQUEST_HEADER_LEN);
@@ -793,17 +901,9 @@ static int perform_register(const NetworkAddress_t *peer_address) {
     }
 
     // 3) Read response header
-    // Response format (Section 3.4):
-    //   4 bytes - body length
-    //   4 bytes - status
-    //   4 bytes - block number
-    //   4 bytes - block count
-    //   32 bytes - block hash
-    //   32 bytes - total hash
-    // Total = 80 bytes.
-    unsigned char resp_hdr[80];
-    ssize_t read_bytes = compsys_helper_readn(sockfd, resp_hdr, 80);
-    if (read_bytes != 80) {
+    unsigned char resp_hdr[REPLY_HEADER_LEN];
+    ssize_t read_bytes = compsys_helper_readn(sockfd, resp_hdr, REPLY_HEADER_LEN);
+    if (read_bytes != REPLY_HEADER_LEN) {
         perror("compsys_helper_readn (response header)");
         close(sockfd);
         return -1;
@@ -825,12 +925,8 @@ static int perform_register(const NetworkAddress_t *peer_address) {
     uint32_t block_count    = ntohl(block_count_net);
 
     // NOTE: We ignore the two SHA256 hashes for now (indices 16..79).
-    // TODO TEAM: verify `block hash` and `total hash` as part of security.
-
-    if (status != 1) {
-        // Status codes in Section 3.4, 1 = OK.
+    if (status != STATUS_OK) {
         fprintf(stderr, "REGISTER failed, status code = %u\n", status);
-        // We still need to read and discard the body if present.
         if (resp_body_len > 0) {
             char *dummy = (char*)malloc(resp_body_len);
             if (dummy) {
@@ -848,7 +944,6 @@ static int perform_register(const NetworkAddress_t *peer_address) {
                 "Multi-block REGISTER response not yet supported "
                 "(block_num=%u, block_count=%u)\n",
                 block_num, block_count);
-        // Discard body
         if (resp_body_len > 0) {
             char *dummy = (char*)malloc(resp_body_len);
             if (dummy) {
@@ -862,7 +957,6 @@ static int perform_register(const NetworkAddress_t *peer_address) {
 
     // 4) Read response body (list of peers), if any
     if (resp_body_len == 0) {
-        // We're probably the first peer on the network.
         close(sockfd);
         return 0;
     }
@@ -892,7 +986,7 @@ static int perform_register(const NetworkAddress_t *peer_address) {
 
 
 // ---------------------------------------------------------------------------
-//  Client-side RETRIEVE (basic stub)
+//  Client-side RETRIEVE (now with multi-block receive and file save)
 // ---------------------------------------------------------------------------
 static int perform_retrieve(const NetworkAddress_t *peer_address, const char *filepath) {
     int sockfd = socket(AF_INET, SOCK_STREAM, 0);
@@ -931,17 +1025,17 @@ static int perform_retrieve(const NetworkAddress_t *peer_address, const char *fi
     memcpy(header + IP_LEN, &port_net, sizeof(port_net));
 
     // Signature (32 bytes)
-    memcpy(header + IP_LEN + 4, my_address->signature, SHA256_HASH_SIZE);
+    memcpy(header + IP_LEN + PORT_LEN, my_address->signature, SHA256_HASH_SIZE);
 
-    // Command = COMMAND_RETREIVE (typisk 2 ifølge spec)
+    // Command = COMMAND_RETREIVE
     uint32_t cmd_net = htonl((uint32_t)COMMAND_RETREIVE);
-    memcpy(header + IP_LEN + 4 + SHA256_HASH_SIZE, &cmd_net, sizeof(cmd_net));
+    memcpy(header + IP_LEN + PORT_LEN + SHA256_HASH_SIZE, &cmd_net, sizeof(cmd_net));
 
     // Body = filepath som bytes (uden '\0')
     size_t name_len = strnlen(filepath, 255);
     uint32_t body_len = (uint32_t)name_len;
     uint32_t bodylen_net = htonl(body_len);
-    memcpy(header + IP_LEN + 4 + SHA256_HASH_SIZE + 4, &bodylen_net, sizeof(bodylen_net));
+    memcpy(header + IP_LEN + PORT_LEN + SHA256_HASH_SIZE + LEN_COMMAND_LENGTH, &bodylen_net, sizeof(bodylen_net));
 
     // Send header
     ssize_t written = compsys_helper_writen(sockfd, header, REQUEST_HEADER_LEN);
@@ -961,93 +1055,223 @@ static int perform_retrieve(const NetworkAddress_t *peer_address, const char *fi
         }
     }
 
+    // We'll receive one or more responses (blocks). We must loop until we have all blocks.
+    // First read the first block header to get block_count.
+    // Since replies are independent messages, read header per block in loop.
 
-    // Læs svar-header (samme format som REGISTER)
-    unsigned char resp_hdr[REPLY_HEADER_LEN];
-    ssize_t read_bytes = compsys_helper_readn(sockfd, resp_hdr, REPLY_HEADER_LEN);
-    if (read_bytes != REPLY_HEADER_LEN) {
-        perror("compsys_helper_readn (RETRIEVE response header)");
-        close(sockfd);
-        return -1;
-    }
+    // We'll store blocks in arrays to reassemble once we got them all.
+    uint32_t expected_block_count = 0;
+    char **block_buffers = NULL;
+    uint32_t *block_lengths = NULL;
+    uint32_t received_blocks = 0;
+    hashdata_t expected_total_hash;
+    int have_total_hash = 0;
 
-    uint32_t resp_body_len_net;
-    uint32_t status_net;
-    uint32_t block_num_net;
-    uint32_t block_count_net;
-
-    memcpy(&resp_body_len_net, resp_hdr + 0, 4);
-    memcpy(&status_net,        resp_hdr + 4, 4);
-    memcpy(&block_num_net,     resp_hdr + 8, 4);
-    memcpy(&block_count_net,   resp_hdr + 12, 4);
-
-    uint32_t resp_body_len = ntohl(resp_body_len_net);
-    uint32_t status         = ntohl(status_net);
-    uint32_t block_num      = ntohl(block_num_net);
-    uint32_t block_count    = ntohl(block_count_net);
-
-    if (status != STATUS_OK) {
-        fprintf(stderr, "RETRIEVE failed, status = %u\n", status);
-        // læs og kassér body hvis der er en fejlbesked
-        if (resp_body_len > 0) {
-            char *dummy = (char*)malloc(resp_body_len);
-            if (dummy) {
-                compsys_helper_readn(sockfd, dummy, resp_body_len);
-                free(dummy);
+    while (1) {
+        unsigned char resp_hdr[REPLY_HEADER_LEN];
+        ssize_t read_bytes = compsys_helper_readn(sockfd, resp_hdr, REPLY_HEADER_LEN);
+        if (read_bytes != REPLY_HEADER_LEN) {
+            perror("compsys_helper_readn (RETRIEVE response header)");
+            // cleanup
+            if (block_buffers) {
+                for (uint32_t i = 0; i < expected_block_count; i++) {
+                    if (block_buffers[i]) free(block_buffers[i]);
+                }
+                free(block_buffers);
+                free(block_lengths);
             }
-        }
-        close(sockfd);
-        return -1;
-    }
-
-    // For nu håndterer vi kun single-block svar (ligesom REGISTER)
-    if (block_count != 1 || block_num != 0) {
-        fprintf(stderr,
-                "Multi-block RETRIEVE response not yet supported "
-                "(block_num=%u, block_count=%u)\n",
-                block_num, block_count);
-        if (resp_body_len > 0) {
-            char *dummy = (char*)malloc(resp_body_len);
-            if (dummy) {
-                compsys_helper_readn(sockfd, dummy, resp_body_len);
-                free(dummy);
-            }
-        }
-        close(sockfd);
-        return -1;
-    }
-
-    if (resp_body_len > 0) {
-        char *body = (char*)malloc(resp_body_len + 1);
-        if (!body) {
-            fprintf(stderr, "malloc failed for RETRIEVE body\n");
             close(sockfd);
             return -1;
         }
 
-        read_bytes = compsys_helper_readn(sockfd, body, resp_body_len);
-        if (read_bytes != (ssize_t)resp_body_len) {
-            perror("compsys_helper_readn (RETRIEVE body)");
-            free(body);
+        uint32_t resp_body_len_net;
+        uint32_t status_net;
+        uint32_t block_num_net;
+        uint32_t block_count_net;
+
+        memcpy(&resp_body_len_net, resp_hdr + 0, 4);
+        memcpy(&status_net,        resp_hdr + 4, 4);
+        memcpy(&block_num_net,     resp_hdr + 8, 4);
+        memcpy(&block_count_net,   resp_hdr + 12, 4);
+
+        uint32_t resp_body_len = ntohl(resp_body_len_net);
+        uint32_t status         = ntohl(status_net);
+        uint32_t block_num      = ntohl(block_num_net);
+        uint32_t block_count    = ntohl(block_count_net);
+
+        // Copy hashes
+        hashdata_t block_hash, total_hash;
+        memcpy(block_hash, resp_hdr + 16, SHA256_HASH_SIZE);
+        memcpy(total_hash, resp_hdr + 16 + SHA256_HASH_SIZE, SHA256_HASH_SIZE);
+
+        if (status != STATUS_OK) {
+            fprintf(stderr, "RETRIEVE failed, status = %u\n", status);
+            // read and discard body if present, cleanup
+            if (resp_body_len > 0) {
+                char *dummy = (char*)malloc(resp_body_len);
+                if (dummy) {
+                    compsys_helper_readn(sockfd, dummy, resp_body_len);
+                    free(dummy);
+                }
+            }
+            if (block_buffers) {
+                for (uint32_t i = 0; i < expected_block_count; i++) {
+                    if (block_buffers[i]) free(block_buffers[i]);
+                }
+                free(block_buffers);
+                free(block_lengths);
+            }
             close(sockfd);
             return -1;
         }
 
-        // midlertidigt: print kun længden, ikke gem filen rigtigt
-        body[resp_body_len] = '\0';
-        printf("RETRIEVE: received %u bytes of data\n", resp_body_len);
-        // TODO (for gruppen): skriv body til fil i src/-mappen
+        if (!have_total_hash) {
+            memcpy(expected_total_hash, total_hash, SHA256_HASH_SIZE);
+            have_total_hash = 1;
+            expected_block_count = block_count;
+            // allocate structures
+            block_buffers = (char**)calloc(expected_block_count, sizeof(char*));
+            block_lengths = (uint32_t*)calloc(expected_block_count, sizeof(uint32_t));
+            if (!block_buffers || !block_lengths) {
+                fprintf(stderr, "Memory allocation failed for blocks\n");
+                if (block_buffers) free(block_buffers);
+                if (block_lengths) free(block_lengths);
+                close(sockfd);
+                return -1;
+            }
+        } else {
+            // ensure block_count matches
+            if (block_count != expected_block_count) {
+                fprintf(stderr, "Inconsistent block_count\n");
+                // cleanup
+                for (uint32_t i = 0; i < expected_block_count; i++) if (block_buffers[i]) free(block_buffers[i]);
+                free(block_buffers); free(block_lengths);
+                close(sockfd);
+                return -1;
+            }
+        }
 
-        free(body);
-    } else {
-        printf("RETRIEVE: response body is empty\n");
+        // Read body
+        char *b = NULL;
+        if (resp_body_len > 0) {
+            b = (char*)malloc(resp_body_len);
+            if (!b) {
+                fprintf(stderr, "malloc failed for RETRIEVE block\n");
+                for (uint32_t i = 0; i < expected_block_count; i++) if (block_buffers[i]) free(block_buffers[i]);
+                free(block_buffers); free(block_lengths);
+                close(sockfd);
+                return -1;
+            }
+            read_bytes = compsys_helper_readn(sockfd, b, resp_body_len);
+            if (read_bytes != (ssize_t)resp_body_len) {
+                perror("compsys_helper_readn (RETRIEVE body)");
+                free(b);
+                for (uint32_t i = 0; i < expected_block_count; i++) if (block_buffers[i]) free(block_buffers[i]);
+                free(block_buffers); free(block_lengths);
+                close(sockfd);
+                return -1;
+            }
+        }
+
+        // Validate block hash
+        hashdata_t computed_block_hash;
+        if (resp_body_len > 0)
+            get_data_sha(b, computed_block_hash, resp_body_len, SHA256_HASH_SIZE);
+        else
+            get_data_sha("", computed_block_hash, 0, SHA256_HASH_SIZE);
+
+        if (memcmp(computed_block_hash, block_hash, SHA256_HASH_SIZE) != 0) {
+            fprintf(stderr, "Block hash mismatch for block %u\n", block_num);
+            if (b) free(b);
+            for (uint32_t i = 0; i < expected_block_count; i++) if (block_buffers[i]) free(block_buffers[i]);
+            free(block_buffers); free(block_lengths);
+            close(sockfd);
+            return -1;
+        }
+
+        // Store block (if not already stored)
+        if (block_num < expected_block_count && block_buffers[block_num] == NULL) {
+            block_buffers[block_num] = b;
+            block_lengths[block_num] = resp_body_len;
+            received_blocks++;
+        } else {
+            // duplicate block or out-of-range
+            if (b) free(b);
+        }
+
+        // If we've received all blocks -> assemble and verify total hash
+        if (received_blocks == expected_block_count) {
+            // compute total size
+            uint32_t total_size = 0;
+            for (uint32_t i = 0; i < expected_block_count; i++) total_size += block_lengths[i];
+
+            char *assembled = (char*)malloc(total_size);
+            if (!assembled) {
+                fprintf(stderr, "malloc failed assembling file\n");
+                for (uint32_t i = 0; i < expected_block_count; i++) if (block_buffers[i]) free(block_buffers[i]);
+                free(block_buffers); free(block_lengths);
+                close(sockfd);
+                return -1;
+            }
+            uint32_t pos = 0;
+            for (uint32_t i = 0; i < expected_block_count; i++) {
+                if (block_lengths[i] > 0) {
+                    memcpy(assembled + pos, block_buffers[i], block_lengths[i]);
+                    pos += block_lengths[i];
+                }
+            }
+
+            // verify total hash
+            hashdata_t computed_total_hash;
+            get_data_sha(assembled, computed_total_hash, total_size, SHA256_HASH_SIZE);
+            if (memcmp(computed_total_hash, expected_total_hash, SHA256_HASH_SIZE) != 0) {
+                fprintf(stderr, "Total hash mismatch\n");
+                free(assembled);
+                for (uint32_t i = 0; i < expected_block_count; i++) if (block_buffers[i]) free(block_buffers[i]);
+                free(block_buffers); free(block_lengths);
+                close(sockfd);
+                return -1;
+            }
+
+            // Write assembled file to disk under src/ (or current directory)
+            // Create file path same as requested filename
+            FILE *out = fopen(filepath, "wb");
+            if (!out) {
+                perror("fopen (write retrieved file)");
+                free(assembled);
+                for (uint32_t i = 0; i < expected_block_count; i++) if (block_buffers[i]) free(block_buffers[i]);
+                free(block_buffers); free(block_lengths);
+                close(sockfd);
+                return -1;
+            }
+            size_t wrote = fwrite(assembled, 1, total_size, out);
+            fclose(out);
+            if (wrote != total_size) {
+                fprintf(stderr, "Failed to write entire file to disk\n");
+                free(assembled);
+                for (uint32_t i = 0; i < expected_block_count; i++) if (block_buffers[i]) free(block_buffers[i]);
+                free(block_buffers); free(block_lengths);
+                close(sockfd);
+                return -1;
+            }
+
+            printf("RETRIEVE: saved file '%s' (%u bytes)\n", filepath, total_size);
+
+            free(assembled);
+            for (uint32_t i = 0; i < expected_block_count; i++) if (block_buffers[i]) free(block_buffers[i]);
+            free(block_buffers); free(block_lengths);
+
+            close(sockfd);
+            return 0;
+        }
+
+        // otherwise continue loop to read next reply (block)
     }
 
+    // unreachable
     close(sockfd);
-    return 0;
+    return -1;
 }
-
-
 
 // Parse the REGISTER response body into the global `network[]` list.
 // Body is a list of entries, each 68 bytes:
@@ -1143,12 +1367,12 @@ static void update_network_from_register_response(const char *body, uint32_t bod
 // ---------------------------------------------------------------------------
 
 int main(int argc, char **argv) {
-    // Users should call this script with a single argument describing what 
+    // Users should call this script with a single argument describing what
     // config to use
     if (argc != 3) {
         fprintf(stderr, "Usage: %s <IP> <PORT>\n", argv[0]);
         exit(EXIT_FAILURE);
-    } 
+    }
 
     my_address = (NetworkAddress_t*)malloc(sizeof(NetworkAddress_t));
     memset(my_address, 0, sizeof(NetworkAddress_t));
@@ -1160,9 +1384,9 @@ int main(int argc, char **argv) {
         fprintf(stderr, ">> Invalid peer IP: %s\n", my_address->ip);
         exit(EXIT_FAILURE);
     }
-    
+
     if (!is_valid_port(my_address->port)) {
-        fprintf(stderr, ">> Invalid peer port: %d\n", 
+        fprintf(stderr, ">> Invalid peer port: %d\n",
             my_address->port);
         exit(EXIT_FAILURE);
     }
@@ -1197,11 +1421,12 @@ int main(int argc, char **argv) {
     if (self_peer) {
         memset(self_peer, 0, sizeof(NetworkAddress_t));
         strncpy(self_peer->ip, my_address->ip, IP_LEN);
+        self_peer->ip[IP_LEN-1] = '\0';
         self_peer->port = my_address->port;
         memcpy(self_peer->signature, my_address->signature, SHA256_HASH_SIZE);
         memcpy(self_peer->salt, my_address->salt, SALT_LEN);
-        
-        NetworkAddress_t** new_network = (NetworkAddress_t**)realloc(network, 
+
+        NetworkAddress_t** new_network = (NetworkAddress_t**)realloc(network,
                                         (peer_count + 1) * sizeof(NetworkAddress_t*));
         if (new_network) {
             network = new_network;
@@ -1214,16 +1439,15 @@ int main(int argc, char **argv) {
     }
     pthread_mutex_unlock(&network_mutex);
 
-    // Setup the client and server threads 
+    // Setup the client and server threads
     pthread_t client_thread_id;
     pthread_t server_thread_id;
     pthread_create(&client_thread_id, NULL, client_thread, NULL);
     pthread_create(&server_thread_id, NULL, server_thread, NULL);
 
-    // Wait for them to complete. 
+    // Wait for them to complete.
     pthread_join(client_thread_id, NULL);
     pthread_join(server_thread_id, NULL);
 
     exit(EXIT_SUCCESS);
 }
-
